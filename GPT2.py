@@ -80,7 +80,7 @@ class CasualSelfAttention(nn.Module):
             y = F.scaled_dot_product_attention(q,k,v,is_causal=True, attn_mask=self.mask[:,:,:T,:k.size(2)])
         else:
             attn = (q @ k.transpose(-2, -1)) * self.scale
-            attn = attn.masked_fill(self.mask[:, :, :T, :k.size(2)] == 0, float("-inf"))
+            attn = attn.masked_fill(self.mask[:, :, :T, :T] == 0, float("-inf"))
             attn = F.softmax(attn, dim=-1)
             attn = self.attn_dropout(attn)
             # (B, n_head, T, T) @ (B, n_head, T, head_dim) -> (B, n_head, T, head_dim)

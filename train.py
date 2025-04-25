@@ -4,7 +4,7 @@ from torch.distributed import init_process_group, destroy_process_group
 from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
 import os
-from data import DataLoader
+from data import DataLoaderLite
 
 
 ddp = int(os.environ.get("RANK", -1)) != -1
@@ -49,27 +49,24 @@ if master_process:
     print(f"total_batch_size: {total_batch_size}")
     print(f"=> grad_accum_steps: {grad_accum_steps}")
 
+train_loader = DataLoaderLite(B=B, T=T, process_rank=rank, num_processes=world_size, split="train")
+val_loader = DataLoaderLite(B=B, T=T, process_rank=rank, num_processes=world_size, split="val")
+
+torch.set_float32_matmul_precision('high')
+
 model = GPT(GPTconfig())
 model = model.to(device)
 model = torch.compile(model)
 if ddp:
     model = DDP(model, device_ids=[local_rank])
 raw_model = model.module if ddp else model
-DataLoaderLite = DataLoader(
-    data_path = "data.txt",
-    batch_size = B,
-    seq_len = T,
-    process_rank = rank,
-    num_processes = world_size
-)
 optimizer = raw_model.configure_optimizers(weight_decay=0.1, learing_rate=max_lr, device=device)
 for step in range(max_steps):
     optimizer.zero_grad()
     loss_accum = 0.0
     for mircostep in range(grad_accum_steps):
-        x, y = DataLoaderLite.get_batch()
-        x = x.to(device)
-        y = y.to(device)
+        x, y = train_loader.next_batch()
+        x, y = x.to(device), y.to(device)
         with torch.autocast(device_type=device,dtype=torch.bfloat16):
             logits,loss = model(x, y)
             loss = loss / grad_accum_steps
@@ -84,6 +81,8 @@ for step in range(max_steps):
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
     optimizer.step()
+    if device == "cuda":
+        torch.cuda.synchronize() 
     if master_process and step % 10 == 0:
         print(f"step{step}, loss: {loss_accum}, lr: {lr}, grad_norm: {norm}")
 if ddp:
