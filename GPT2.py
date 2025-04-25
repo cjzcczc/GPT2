@@ -1,6 +1,7 @@
 import torch
 import math
 import torch.nn as nn
+import inspect
 from dataclasses import dataclass
 from torch.nn import functional as F
 @dataclass
@@ -13,6 +14,7 @@ class GPTconfig:
     attn_pdrop : float= 0.1
     resid_pdrop : float= 0.1
     max_batch_size : int= 32
+    use_flash_attn : bool= False
 
 def apply_rope(q, k, seq_len, head_dim, device):
     position_ids = torch.arange(seq_len, dtype=torch.float, device=device)
@@ -39,6 +41,7 @@ class CasualSelfAttention(nn.Module):
         self.scale = 1 / (self.head_dim ** 0.5)
         self.LMAX = 512  # KV Cache 的最大长度
         # KV Cache 初始化为 None，推理时动态分配
+        self.use_flash_attn = config.use_flash_attn 
         self.cached_k = None
         self.cached_v = None
 
@@ -53,7 +56,7 @@ class CasualSelfAttention(nn.Module):
     
     def forward(self, x, use_cache=False):
         B, T, C = x.size()
-                # qkv (B, T, 3*C) -> (B, T, 3, n_head, head_dim)
+        # qkv (B, T, 3*C) -> (B, T, 3, n_head, head_dim)
         # qkv (B, T, 3, n_head, head_dim) -> (3, B, n_head, T, head_dim)
         qkv = self.c_attn(x).view(B, T, 3, self.n_head, self.head_dim).permute(2, 0, 3, 1, 4)
                 # q,k,v = (B, n_head, T, head_dim)
@@ -73,14 +76,16 @@ class CasualSelfAttention(nn.Module):
             k, v = self.cached_k, self.cached_v
 
         # 注意力计算
-        y = F.scaled_dot_product_attention(q,k,v,is_causal=True, attn_mask=self.mask[:,:,:T,:k.size(2)])
-        # attn = (q @ k.transpose(-2, -1)) * self.scale
-        # attn = attn.masked_fill(self.mask[:, :, :T, :k.size(2)] == 0, float("-inf"))
-        # attn = F.softmax(attn, dim=-1)
-        # attn = self.attn_dropout(attn)
-        # # (B, n_head, T, T) @ (B, n_head, T, head_dim) -> (B, n_head, T, head_dim)
-        # # (B, n_head, T, head_dim) -> (B, T, n_head, head_dim) -> (B, T, C)
-        # y = (attn @ v).transpose(1,2).contiguous().view(B,T,C)
+        if self.use_flash_attn:
+            y = F.scaled_dot_product_attention(q,k,v,is_causal=True, attn_mask=self.mask[:,:,:T,:k.size(2)])
+        else:
+            attn = (q @ k.transpose(-2, -1)) * self.scale
+            attn = attn.masked_fill(self.mask[:, :, :T, :k.size(2)] == 0, float("-inf"))
+            attn = F.softmax(attn, dim=-1)
+            attn = self.attn_dropout(attn)
+            # (B, n_head, T, T) @ (B, n_head, T, head_dim) -> (B, n_head, T, head_dim)
+            # (B, n_head, T, head_dim) -> (B, T, n_head, head_dim) -> (B, T, C)
+            y = (attn @ v).transpose(1,2).contiguous().view(B,T,C)
         y = self.resid_dropout(self.c_proj(y))
         return y
 
@@ -211,3 +216,24 @@ class GPT(nn.Module):
                     sd[k].copy_(sd_hf[k])
 
         return model
+    
+    def configure_optimizers(self, weight_decay,learing_rate,device):
+        param_dict = {pn: p for pn, p in self.named_parameters()}
+        param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
+
+        decay_params = [p for pn, p in param_dict.items() if p.dim() >= 2]
+        no_decay_params = [p for pn, p in param_dict.items() if p.dim() < 2]
+        optim_group = {
+            {'params': decay_params, 'weight_decay': weight_decay},
+            {'params': no_decay_params, 'weight_decay': 0.0}
+        }
+        num_params = sum(p.numel() for p in param_dict.values())
+        num_nodecay_params = sum(p.numel() for p in no_decay_params)
+        print(f"num decayed parameter tensors: {len(decay_params)}, with {num_params:,} parameters")
+        print(f"num no-decayed parameter tensors: {len(no_decay_params)}, with {num_nodecay_params:,} parameters")
+        fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
+        use_fused = fused_available and device == 'cuda'
+        print(f"using fused AdamW: {use_fused}")
+        optimizer = torch.optim.AdamW(optim_group, lr=learing_rate, betas=(0.9, 0.95), eps=1e-8,fused=use_fused)
+        return optimizer
+
